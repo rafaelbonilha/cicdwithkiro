@@ -1,0 +1,58 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CDKDeployPermissions",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateStack",
+        "cloudformation:UpdateStack",
+        "cloudformation:DescribeStacks",
+        "cloudformation:DescribeStackEvents",
+        "cloudformation:DescribeStackResources",
+        "cloudformation:GetTemplate",
+        "cloudformation:DeleteStack"
+      ],
+      "Resource": "arn:aws:cloudformation:us-east-1:123456789012:stack/SEU-PROJETO-*/*"
+    },
+    {
+      "Sid": "CDKAssetsBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::cdk-hnb659fds-assets-123456789012-us-east-1",
+        "arn:aws:s3:::cdk-hnb659fds-assets-123456789012-us-east-1/*"
+      ]
+    },
+    {
+      "Sid": "AssumeCDKExecutionRole",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::123456789012:role/cdk-hnb659fds-*-role-123456789012-us-east-1"
+    },
+    {
+      "Sid": "KiroLogInvestigation",
+      "Effect": "Allow",
+      "Action": [
+        "logs:GetLogEvents",
+        "logs:FilterLogEvents",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:123456789012:log-group:/aws/*:*"
+    },
+    {
+      "Sid": "KiroBedrockInference",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

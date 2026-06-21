@@ -1,0 +1,436 @@
+name: Notificações do Pipeline
+
+# ---------------------------------------------------------------------------
+# Este workflow é acionado automaticamente após a conclusão do pipeline
+# principal (ci-cd-kiro.yml) para enviar notificações sobre o resultado
+# do deploy.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_run:
+    workflows: ["CI/CD com Kiro + AWS"]
+    types:
+      - completed
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: meu-projeto
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+  MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+  MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+  TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+  DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+jobs:
+  # =========================================================================
+  # 1) NOTIFICAÇÃO NO SLACK
+  # =========================================================================
+  notify-slack:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion != 'skipped' }}
+    steps:
+      - name: Baixar artefatos do pipeline principal
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: ci-cd-kiro.yml
+          run_id: ${{ github.event.workflow_run.id }}
+          name: pipeline-status
+          path: ./artifacts
+
+      - name: Ler status do pipeline
+        id: status
+        run: |
+          if [ -f ./artifacts/status.json ]; then
+            STATUS=$(jq -r '.status' ./artifacts/status.json)
+            DEPLOY_STATUS=$(jq -r '.deploy_status' ./artifacts/status.json)
+            HEALTH_STATUS=$(jq -r '.health_status' ./artifacts/status.json)
+          else
+            STATUS="${{ github.event.workflow_run.conclusion }}"
+            DEPLOY_STATUS="unknown"
+            HEALTH_STATUS="unknown"
+          fi
+          
+          # Determinar emoji e mensagem
+          if [ "$STATUS" == "success" ] && [ "$HEALTH_STATUS" == "success" ]; then
+            EMOJI="🚀"
+            COLOR="good"
+            MESSAGE="DEPLOY BEM-SUCEDIDO ✅"
+          elif [ "$STATUS" == "failure" ] && [ "$DEPLOY_STATUS" == "failure" ]; then
+            EMOJI="🔴"
+            COLOR="danger"
+            MESSAGE="DEPLOY FALHOU ❌"
+          elif [ "$STATUS" == "failure" ] && [ "$HEALTH_STATUS" == "failure" ]; then
+            EMOJI="⚠️"
+            COLOR="warning"
+            MESSAGE="HEALTH CHECK FALHOU ⚠️"
+          elif [ "$STATUS" == "cancelled" ]; then
+            EMOJI="⏹️"
+            COLOR="#808080"
+            MESSAGE="PIPELINE CANCELADO"
+          else
+            EMOJI="ℹ️"
+            COLOR="#0077B5"
+            MESSAGE="STATUS: $STATUS"
+          fi
+          
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "emoji=$EMOJI" >> $GITHUB_OUTPUT
+          echo "color=$COLOR" >> $GITHUB_OUTPUT
+          echo "message=$MESSAGE" >> $GITHUB_OUTPUT
+
+      - name: Enviar notificação para Slack
+        if: env.SLACK_BOT_TOKEN != ''
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: '#deployments'
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ steps.status.outputs.emoji }} ${{ steps.status.outputs.message }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*📦 Projeto:*\n${{ env.PROJECT_NAME }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*🌍 Região:*\n${{ env.AWS_REGION }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*📝 Commit:*\n<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.event.workflow_run.head_sha }}|${{ github.event.workflow_run.head_sha }}>"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*👤 Autor:*\n${{ github.event.workflow_run.head_commit.author.name || 'Desconhecido' }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*📊 Status Deploy:*\n${{ steps.status.outputs.deploy_status || 'N/A' }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*❤️ Health Check:*\n${{ steps.status.outputs.health_status || 'N/A' }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "🔗 <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}|Ver logs completos>"
+                  }
+                },
+                {
+                  "type": "divider"
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "🕐 $(date '+%d/%m/%Y %H:%M:%S') - Pipeline executado pelo GitHub Actions"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_BOT_TOKEN: ${{ env.SLACK_BOT_TOKEN }}
+
+  # =========================================================================
+  # 2) NOTIFICAÇÃO POR E-MAIL (apenas em falhas)
+  # =========================================================================
+  notify-email:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    steps:
+      - name: Baixar artefatos
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: ci-cd-kiro.yml
+          run_id: ${{ github.event.workflow_run.id }}
+          name: pipeline-status
+          path: ./artifacts
+
+      - name: Enviar e-mail de alerta
+        if: env.MAIL_USERNAME != '' && env.MAIL_PASSWORD != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ env.MAIL_USERNAME }}
+          password: ${{ env.MAIL_PASSWORD }}
+          subject: "🔴 [URGENTE] Deploy falhou - ${{ env.PROJECT_NAME }}"
+          to: |
+            dev-team@empresa.com
+            on-call@empresa.com
+          from: CI/CD Pipeline <${{ env.MAIL_USERNAME }}>
+          priority: high
+          body: |
+            🔴 **DEPLOY FALHOU - AÇÃO URGENTE**
+
+            O pipeline de deploy falhou no ambiente de produção.
+
+            **Detalhes:**
+            - Projeto: ${{ env.PROJECT_NAME }}
+            - Ambiente: ${{ env.AWS_REGION }}
+            - Commit: ${{ github.event.workflow_run.head_sha }}
+            - Autor: ${{ github.event.workflow_run.head_commit.author.name || 'Desconhecido' }}
+            - Execução: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}
+
+            **Próximos passos:**
+            1. ✅ Verificar logs do CloudFormation
+            2. ✅ Verificar logs do CloudWatch
+            3. ✅ Identificar causa raiz
+            4. ✅ Aplicar correção em PR
+
+            **Links úteis:**
+            - CloudFormation: https://console.aws.amazon.com/cloudformation/home?region=${{ env.AWS_REGION }}
+            - CloudWatch: https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}
+            - GitHub Actions: ${{ github.server_url }}/${{ github.repository }}/actions
+
+            ⚠️ **Este é um alerta automático. Por favor, não responda a este e-mail.**
+
+      - name: Fallback - criar issue no GitHub
+        if: env.MAIL_USERNAME == '' || env.MAIL_PASSWORD == ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "🔴 Deploy falhou - ${{ github.event.workflow_run.head_sha }}" \
+            --body "## Falha no deploy detectada
+
+            O pipeline de deploy falhou. Como as credenciais de e-mail não estão configuradas, esta issue foi criada como fallback.
+
+            **Detalhes:**
+            - Projeto: ${{ env.PROJECT_NAME }}
+            - Ambiente: ${{ env.AWS_REGION }}
+            - Commit: ${{ github.event.workflow_run.head_sha }}
+            - Autor: ${{ github.event.workflow_run.head_commit.author.name || 'Desconhecido' }}
+            - Execução: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}
+
+            **Ação necessária:**
+            1. Verificar logs do CloudFormation
+            2. Identificar causa raiz
+            3. Aplicar correção em PR
+
+            **Labels:** bug, critical, needs-human-intervention" \
+            --label "bug,critical,needs-human-intervention"
+
+  # =========================================================================
+  # 3) NOTIFICAÇÃO NO MICROSOFT TEAMS
+  # =========================================================================
+  notify-teams:
+    runs-on: ubuntu-latest
+    if: env.TEAMS_WEBHOOK_URL != '' && github.event.workflow_run.conclusion != 'skipped'
+    steps:
+      - name: Determinar status
+        id: status
+        run: |
+          STATUS="${{ github.event.workflow_run.conclusion }}"
+          if [ "$STATUS" == "success" ]; then
+            COLOR="00FF00"
+            MESSAGE="✅ Deploy bem-sucedido"
+          elif [ "$STATUS" == "failure" ]; then
+            COLOR="FF0000"
+            MESSAGE="❌ Deploy falhou"
+          else
+            COLOR="FFA500"
+            MESSAGE="⚠️ Pipeline: $STATUS"
+          fi
+          echo "color=$COLOR" >> $GITHUB_OUTPUT
+          echo "message=$MESSAGE" >> $GITHUB_OUTPUT
+
+      - name: Enviar notificação para Teams
+        uses: aliencube/microsoft-teams-actions@v0.8.0
+        with:
+          webhook_uri: ${{ env.TEAMS_WEBHOOK_URL }}
+          title: "${{ env.PROJECT_NAME }} - ${{ steps.status.outputs.message }}"
+          summary: "Pipeline executado para ${{ github.event.workflow_run.head_sha }}"
+          theme_color: ${{ steps.status.outputs.color }}
+          sections: |
+            [
+              {
+                "activityTitle": "📦 ${{ env.PROJECT_NAME }}",
+                "activitySubtitle": "Ambiente: ${{ env.AWS_REGION }}",
+                "facts": [
+                  {
+                    "name": "Status",
+                    "value": "${{ steps.status.outputs.message }}"
+                  },
+                  {
+                    "name": "Commit",
+                    "value": "${{ github.event.workflow_run.head_sha }}"
+                  },
+                  {
+                    "name": "Autor",
+                    "value": "${{ github.event.workflow_run.head_commit.author.name || 'Desconhecido' }}"
+                  },
+                  {
+                    "name": "Logs",
+                    "value": "[Ver no GitHub](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }})"
+                  }
+                ]
+              }
+            ]
+
+  # =========================================================================
+  # 4) NOTIFICAÇÃO NO DISCORD
+  # =========================================================================
+  notify-discord:
+    runs-on: ubuntu-latest
+    if: env.DISCORD_WEBHOOK_URL != '' && github.event.workflow_run.conclusion != 'skipped'
+    steps:
+      - name: Determinar status
+        id: status
+        run: |
+          STATUS="${{ github.event.workflow_run.conclusion }}"
+          if [ "$STATUS" == "success" ]; then
+            COLOR=3066993
+            MESSAGE="✅ Deploy bem-sucedido"
+          elif [ "$STATUS" == "failure" ]; then
+            COLOR=15158332
+            MESSAGE="❌ Deploy falhou"
+          else
+            COLOR=15844367
+            MESSAGE="⚠️ Pipeline: $STATUS"
+          fi
+          echo "color=$COLOR" >> $GITHUB_OUTPUT
+          echo "message=$MESSAGE" >> $GITHUB_OUTPUT
+
+      - name: Enviar notificação para Discord
+        uses: sarisia/actions-disord@v1
+        with:
+          webhook: ${{ env.DISCORD_WEBHOOK_URL }}
+          username: "CI/CD Pipeline"
+          avatar: "https://avatars.githubusercontent.com/github"
+          title: "${{ env.PROJECT_NAME }}"
+          description: "${{ steps.status.outputs.message }}"
+          color: ${{ steps.status.outputs.color }}
+          fields: |
+            [
+              {
+                "name": "🌍 Ambiente",
+                "value": "${{ env.AWS_REGION }}",
+                "inline": true
+              },
+              {
+                "name": "📝 Commit",
+                "value": "${{ github.event.workflow_run.head_sha }}",
+                "inline": true
+              },
+              {
+                "name": "👤 Autor",
+                "value": "${{ github.event.workflow_run.head_commit.author.name || 'Desconhecido' }}",
+                "inline": true
+              },
+              {
+                "name": "🔗 Logs",
+                "value": "[Clique aqui](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }})",
+                "inline": false
+              }
+            ]
+          timestamp: true
+
+  # =========================================================================
+  # 5) MÉTRICAS E ESTATÍSTICAS
+  # =========================================================================
+  collect-metrics:
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion != 'skipped'
+    steps:
+      - name: Coletar métricas do pipeline
+        id: metrics
+        run: |
+          DURATION=$(( ${{ github.event.workflow_run.updated_at }} - ${{ github.event.workflow_run.created_at }} ))
+          echo "duration=$DURATION" >> $GITHUB_OUTPUT
+          echo "conclusion=${{ github.event.workflow_run.conclusion }}" >> $GITHUB_OUTPUT
+          echo "event=${{ github.event.workflow_run.event }}" >> $GITHUB_OUTPUT
+
+      - name: Enviar métricas para CloudWatch (opcional)
+        if: env.AWS_REGION != ''
+        run: |
+          aws cloudwatch put-metric-data \
+            --namespace "CI/CD/${{ env.PROJECT_NAME }}" \
+            --metric-name PipelineDuration \
+            --value ${{ steps.metrics.outputs.duration }} \
+            --unit Seconds \
+            --dimensions Status=${{ steps.metrics.outputs.conclusion }}
+
+          aws cloudwatch put-metric-data \
+            --namespace "CI/CD/${{ env.PROJECT_NAME }}" \
+            --metric-name PipelineStatus \
+            --value ${{ steps.metrics.outputs.conclusion == 'success' && 1 || 0 }} \
+            --unit Count \
+            --dimensions Event=${{ steps.metrics.outputs.event }}
+
+      - name: Salvar métricas como artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-metrics
+          path: |
+            metrics.json
+          retention-days: 30
+
+  # =========================================================================
+  # 6) STATUS BADGE (atualizar badge de status)
+  # =========================================================================
+  update-badge:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event.workflow_run.conclusion != 'skipped'
+    steps:
+      - name: Gerar badge de status
+        id: badge
+        run: |
+          STATUS="${{ github.event.workflow_run.conclusion }}"
+          if [ "$STATUS" == "success" ]; then
+            COLOR="brightgreen"
+            LABEL="passing"
+          elif [ "$STATUS" == "failure" ]; then
+            COLOR="red"
+            LABEL="failing"
+          else:
+            COLOR="yellow"
+            LABEL="unknown"
+          fi
+          echo "color=$COLOR" >> $GITHUB_OUTPUT
+          echo "label=$LABEL" >> $GITHUB_OUTPUT
+
+      - name: Criar badge SVG
+        run: |
+          cat > badge.svg << 'EOF'
+          <svg xmlns="http://www.w3.org/2000/svg" width="120" height="20">
+            <linearGradient id="s" x2="0" y2="100%">
+              <stop offset="0" stop-color="#bbb" stop-opacity=".1"/>
+              <stop offset="1" stop-opacity=".1"/>
+            </linearGradient>
+            <rect width="120" height="20" rx="3" fill="#555"/>
+            <rect x="70" width="50" height="20" fill="${{ steps.badge.outputs.color }}" rx="3"/>
+            <rect x="70" width="50" height="20" fill="${{ steps.badge.outputs.color }}" rx="3"/>
+            <path fill="${{ steps.badge.outputs.color }}" d="M73 0h4v20h-4z"/>
+            <text x="35" y="15" font-family="Verdana" font-size="11" fill="#fff" text-anchor="middle">deploy</text>
+            <text x="95" y="15" font-family="Verdana" font-size="11" fill="#fff" text-anchor="middle">${{ steps.badge.outputs.label }}</text>
+          </svg>
+          EOF
+
+      - name: Upload badge
+        uses: actions/upload-artifact@v4
+        with:
+          name: status-badge
+          path: badge.svg
+          retention-days: 7

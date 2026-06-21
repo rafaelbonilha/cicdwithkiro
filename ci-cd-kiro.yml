@@ -1,0 +1,552 @@
+name: CI/CD com Kiro + AWS
+
+# ---------------------------------------------------------------------------
+# Visão geral do pipeline:
+# 1) security-scan      -> varredura de segurança (Trivy)
+# 2) build-test         -> instala dependências, roda lint e testes
+# 3) kiro-review        -> Kiro CLI revisa o diff do PR e comenta achados
+# 4) deploy             -> autentica na AWS via OIDC e faz deploy (CDK)
+# 5) post-deploy-validate -> health check da aplicação
+# 6) rollback           -> se health check falhar, faz rollback
+# 7) kiro-auto-fix      -> se o deploy falhar, Kiro investiga, corrige e abre PR
+# 8) notify             -> notifica time sobre o resultado
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+  security-events: write
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ROLE_ARN: arn:aws:iam::123456789012:role/github-actions-kiro-deploy
+  PROJECT_NAME: meu-projeto
+  MAX_AUTO_FIX_ATTEMPTS: 2
+
+jobs:
+  # =========================================================================
+  # 1) SECURITY SCAN (rodar em paralelo com build-test)
+  # =========================================================================
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # =========================================================================
+  # 2) BUILD & TEST
+  # =========================================================================
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Cache de dependências
+        uses: actions/cache@v3
+        with:
+          path: |
+            node_modules
+            ~/.npm
+            ~/.cdk
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Testes unitários
+        run: npm test -- --coverage
+
+      - name: Upload de cobertura
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+
+      - name: CDK Synth (validação de infraestrutura)
+        run: |
+          npm install -g aws-cdk
+          cdk synth --strict
+
+  # =========================================================================
+  # 3) REVISÃO DE CÓDIGO COM KIRO (somente em Pull Requests)
+  # =========================================================================
+  kiro-review:
+    needs: [security-scan, build-test]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Instalar Kiro CLI
+        uses: clouatre-labs/setup-kiro-action@v1
+        with:
+          enable-sigv4: true
+
+      - name: Kiro revisa o diff do PR
+        env:
+          AMAZON_Q_SIGV4: "true"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          kiro-cli --print "
+            Revise o diff deste Pull Request contra a branch main.
+            
+            Contexto:
+            - PR #${{ github.event.pull_request.number }}
+            - Autor: ${{ github.event.pull_request.user.login }}
+            - Arquivos alterados: $(git diff --name-only HEAD~1 | wc -l)
+            
+            Verifique:
+            1. Bugs potenciais no código
+            2. Problemas de segurança (secrets, IAM permissivo, portas abertas)
+            3. Violações das convenções definidas em .kiro/steering/
+            4. Ausência de testes para novas funcionalidades
+            5. Mudanças que podem afetar performance
+            6. Logs e observabilidade adequados
+            
+            Classifique cada achado como:
+            🔴 Bloqueante - deve impedir o merge
+            🟡 Atenção - recomendado corrigir
+            🔵 Sugestão - melhoria opcional
+            
+            Ao final, publique um comentário resumido no PR usando o GitHub CLI.
+          "
+
+  # =========================================================================
+  # 4) DEPLOY NA AWS (somente após merge na main)
+  # =========================================================================
+  deploy:
+    needs: [security-scan, build-test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      deploy_status: ${{ steps.deploy.outcome }}
+      stack_name: ${{ steps.deploy.outputs.stack_name }}
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Restaurar cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            node_modules
+            ~/.cdk
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Instalar AWS CDK
+        run: npm install -g aws-cdk
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: CDK Synth
+        run: cdk synth
+
+      - name: CDK Deploy
+        id: deploy
+        run: |
+          cdk deploy --all --require-approval never --outputs-file cdk-outputs.json
+          echo "stack_name=$(jq -r 'keys[0]' cdk-outputs.json)" >> $GITHUB_OUTPUT
+
+      - name: Salvar outputs do CDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: cdk-outputs
+          path: cdk-outputs.json
+
+  # =========================================================================
+  # 5) HEALTH CHECK PÓS-DEPLOY
+  # =========================================================================
+  post-deploy-validate:
+    needs: deploy
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      health_status: ${{ steps.health_check.outcome }}
+    steps:
+      - name: Download outputs do CDK
+        uses: actions/download-artifact@v4
+        with:
+          name: cdk-outputs
+
+      - name: Aguardar estabilização
+        run: sleep 30
+
+      - name: Health Check da aplicação
+        id: health_check
+        run: |
+          API_URL=$(jq -r '.[].ApiUrl' cdk-outputs.json)
+          
+          echo "🔍 Verificando health check em: $API_URL/health"
+          
+          # Health check com timeout e retry
+          for i in {1..3}; do
+            if curl -f -s -o /dev/null -w "%{http_code}" "$API_URL/health" | grep -q "200"; then
+              echo "✅ Health check passou na tentativa $i"
+              exit 0
+            fi
+            echo "⏳ Tentativa $i falhou, aguardando..."
+            sleep 10
+          done
+          
+          echo "❌ Health check falhou após 3 tentativas"
+          exit 1
+
+      - name: Validar métricas CloudWatch
+        if: success()
+        run: |
+          # Verificar se há erros nas últimas 5 minutos
+          ERRORS=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/Lambda \
+            --metric-name Errors \
+            --dimensions Name=FunctionName,Value=meu-projeto-lambda \
+            --start-time "$(date -d '5 minutes ago' -Iseconds)" \
+            --end-time "$(date -Iseconds)" \
+            --period 300 \
+            --statistics Sum \
+            --query 'Datapoints[0].Sum' \
+            --output text)
+          
+          if [ "$ERRORS" != "None" ] && [ "$ERRORS" -gt 0 ]; then
+            echo "⚠️ Atenção: $ERRORS erros detectados nas últimas 5 minutos"
+            # Não falha o job, apenas alerta
+          else
+            echo "✅ Nenhum erro detectado nas métricas"
+          fi
+
+  # =========================================================================
+  # 6) ROLLBACK (se health check falhar)
+  # =========================================================================
+  rollback:
+    needs: [deploy, post-deploy-validate]
+    if: failure() && needs.post-deploy-validate.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Instalar AWS CDK
+        run: npm install -g aws-cdk
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Rollback para versão anterior
+        run: |
+          echo "🔄 Iniciando rollback..."
+          # Rollback usando o último deploy bem-sucedido
+          cdk deploy --previous-parameters --rollback
+          
+          # Verificar se o rollback foi bem-sucedido
+          if [ $? -eq 0 ]; then
+            echo "✅ Rollback executado com sucesso"
+          else
+            echo "❌ Falha no rollback, intervenção manual necessária"
+            exit 1
+          fi
+
+      - name: Notificar rollback
+        run: |
+          echo "🚨 Rollback executado para a versão anterior"
+          echo "Por favor, verificar o estado da aplicação"
+
+  # =========================================================================
+  # 7) AUTO-CORREÇÃO COM KIRO (limitado a 2 tentativas)
+  # =========================================================================
+  kiro-auto-fix:
+    needs: [deploy, post-deploy-validate]
+    if: failure() && (needs.deploy.result == 'failure' || needs.post-deploy-validate.result == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Instalar Kiro CLI
+        uses: clouatre-labs/setup-kiro-action@v1
+        with:
+          enable-sigv4: true
+
+      - name: Configurar Git para commits automáticos
+        run: |
+          git config user.name "kiro-bot"
+          git config user.email "kiro-bot@users.noreply.github.com"
+
+      - name: Verificar limite de tentativas
+        id: check_attempts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Contar PRs abertos do kiro-bot para este commit
+          PR_COUNT=$(gh pr list --head "fix/deploy-failure-${{ github.sha }}" --state open --json number | jq length)
+          if [ $PR_COUNT -ge ${{ env.MAX_AUTO_FIX_ATTEMPTS }} ]; then
+            echo "❌ Limite de ${{ env.MAX_AUTO_FIX_ATTEMPTS }} tentativas atingido"
+            echo "abort=true" >> $GITHUB_OUTPUT
+          else
+            echo "abort=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Kiro investiga e corrige
+        if: steps.check_attempts.outputs.abort == 'false'
+        env:
+          AMAZON_Q_SIGV4: "true"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PREVIOUS_COMMIT: ${{ github.event.before }}
+        run: |
+          ATTEMPT_NUMBER=${{ steps.check_attempts.outputs.attempt_count || 1 }}
+          BRANCH_NAME="fix/deploy-failure-${{ github.sha }}-attempt-$ATTEMPT_NUMBER"
+          
+          git checkout -b $BRANCH_NAME
+
+          kiro-cli --print "
+            O deploy falhou na execução ${{ github.run_id }}.
+            
+            Contexto:
+            - Commit atual: ${{ github.sha }}
+            - Commit anterior: ${{ env.PREVIOUS_COMMIT }}
+            - Ambiente: ${{ env.AWS_REGION }}
+            - Tentativa: $ATTEMPT_NUMBER de ${{ env.MAX_AUTO_FIX_ATTEMPTS }}
+            - Stack: ${{ needs.deploy.outputs.stack_name }}
+            
+            Instruções:
+            1. Analise os logs do CloudFormation para identificar a causa raiz
+            2. Verifique os logs do CloudWatch para o grupo /aws/lambda/* relacionado
+            3. Compare o diff entre o commit atual e o anterior
+            4. Identifique a causa raiz da falha
+            
+            Se a causa raiz for:
+            - Erro de sintaxe em CDK: corrija o arquivo .ts relevante
+            - Erro de runtime em Lambda: corrija o código do handler
+            - Configuração incorreta: ajuste o arquivo de configuração
+            - Falta de dependência: adicione ao package.json
+            - Problema de IAM: NÃO altere IAM - apenas documente
+            - Problema de rede: NÃO altere Security Groups - apenas documente
+            
+            Regras:
+            - NUNCA altere mais de 3 arquivos
+            - NUNCA remova testes
+            - NUNCA altere arquivos em .github/workflows/ ou .kiro/
+            - SEMPRE documente a causa raiz no commit
+            - Se não conseguir identificar com confiança > 70%, NÃO corrija
+            
+            Após aplicar a correção:
+            - Execute npm run build para validar
+            - Execute npm test para garantir que os testes passam
+            - Documente no commit: 'fix: causa_raiz (auto-corrigido pelo Kiro)'
+          "
+
+          git add -A
+          git commit -m "fix: corrige falha de deploy (run ${{ github.run_id }}, attempt $ATTEMPT_NUMBER)
+
+          Causa raiz: [preenchido pelo Kiro]
+          Correção aplicada: [preenchido pelo Kiro]
+          Risco residual: [preenchido pelo Kiro]
+
+          Co-authored-by: kiro-bot <kiro-bot@users.noreply.github.com>" || echo "Nada para commitar"
+
+          git push origin $BRANCH_NAME
+
+          gh pr create \
+            --title "fix: corrige falha de deploy (run ${{ github.run_id }}) - attempt $ATTEMPT_NUMBER" \
+            --body "## 🤖 Correção automática gerada pelo Kiro
+
+            ### Causa raiz identificada
+            [preenchido pelo Kiro]
+
+            ### Mudança aplicada
+            - Arquivos alterados: [lista]
+            - Descrição: [breve descrição]
+
+            ### Testes realizados
+            - ✅ Build local passou
+            - ✅ Testes unitários passaram
+            - ⏳ Deploy aguardando validação
+
+            ### Risco residual
+            [O que o revisor deve verificar]
+
+            ### Contexto
+            - Execução: ${{ github.run_id }}
+            - Commit: ${{ github.sha }}
+            - Tentativa: $ATTEMPT_NUMBER de ${{ env.MAX_AUTO_FIX_ATTEMPTS }}
+
+            ⚠️ **Revisão humana obrigatória antes do merge**" \
+            --base main \
+            --head $BRANCH_NAME
+
+      - name: Escalonar para humano (limite excedido)
+        if: steps.check_attempts.outputs.abort == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "🔴 Falha de deploy não resolvida (run ${{ github.run_id }})" \
+            --body "## Intervenção humana necessária
+
+            O Kiro tentou corrigir automaticamente a falha de deploy, mas o limite de ${{ env.MAX_AUTO_FIX_ATTEMPTS }} tentativas foi atingido.
+
+            **Detalhes:**
+            - Execução: ${{ github.run_id }}
+            - Commit: ${{ github.sha }}
+            - Ambiente: ${{ env.AWS_REGION }}
+            - Stack: ${{ needs.deploy.outputs.stack_name }}
+            - Data: $(date)
+
+            **Próximos passos:**
+            1. Verificar os logs do CloudFormation
+            2. Identificar a causa raiz manualmente
+            3. Aplicar a correção em um PR manual
+
+            **Links úteis:**
+            - Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            - AWS Console: https://console.aws.amazon.com/cloudformation/home?region=${{ env.AWS_REGION }}" \
+            --label "bug,critical,needs-human-intervention"
+
+  # =========================================================================
+  # 8) NOTIFICAÇÕES
+  # =========================================================================
+  notify:
+    needs: [deploy, post-deploy-validate, rollback, kiro-auto-fix]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determinar status final
+        id: status
+        run: |
+          if [ "${{ needs.deploy.result }}" == "success" ] && [ "${{ needs.post-deploy-validate.result }}" == "success" ]; then
+            echo "status=✅ DEPLOY BEM-SUCEDIDO" >> $GITHUB_OUTPUT
+            echo "emoji=🚀" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.rollback.result }}" == "success" ]; then
+            echo "status=⚠️ ROLLBACK EXECUTADO" >> $GITHUB_OUTPUT
+            echo "emoji=🔄" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.kiro-auto-fix.result }}" == "success" ]; then
+            echo "status=🔧 CORREÇÃO AUTOMÁTICA GERADA" >> $GITHUB_OUTPUT
+            echo "emoji=🤖" >> $GITHUB_OUTPUT
+          else
+            echo "status=❌ FALHA NO DEPLOY" >> $GITHUB_OUTPUT
+            echo "emoji=🔴" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Notificar Slack
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: '#deployments'
+          slack-message: |
+            ${{ steps.status.outputs.emoji }} *${{ steps.status.outputs.status }}*
+
+            📦 Projeto: ${{ github.repository }}
+            🌍 Ambiente: ${{ env.AWS_REGION }}
+            📝 Commit: ${{ github.sha }}
+            👤 Autor: ${{ github.actor }}
+            🔗 Execução: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+            📊 Resumo:
+            - Security Scan: ${{ needs.security-scan.result }}
+            - Build/Test: ${{ needs.build-test.result }}
+            - Deploy: ${{ needs.deploy.result }}
+            - Health Check: ${{ needs.post-deploy-validate.result }}
+            - Rollback: ${{ needs.rollback.result || 'N/A' }}
+            - Kiro Auto-Fix: ${{ needs.kiro-auto-fix.result || 'N/A' }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Notificar por e-mail (fallback para falhas críticas)
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "🔴 DEPLOY FALHOU - ${{ github.repository }}"
+          to: dev-team@empresa.com
+          from: CI/CD Pipeline <ci-cd@empresa.com>
+          body: |
+            O deploy falhou na execução ${{ github.run_id }}.
+            
+            Detalhes:
+            - Repositório: ${{ github.repository }}
+            - Commit: ${{ github.sha }}
+            - Autor: ${{ github.actor }}
+            - Ambiente: ${{ env.AWS_REGION }}
+            
+            Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+            Ação necessária: Verificar logs e corrigir manualmente.
