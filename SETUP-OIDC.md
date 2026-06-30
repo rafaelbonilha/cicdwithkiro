@@ -1,7 +1,7 @@
 # Setup do OIDC entre GitHub Actions e AWS
 
 Este documento descreve os passos para configurar a autenticação OIDC entre GitHub Actions e AWS.
-thumbprint abaixo não precisa ser atualizado manualmente se o GitHub rotacionar certificados. O parâmetro é exigido pela CLI, mas seu valor exato tem efeito reduzido na validação atual.
+O thumbprint abaixo não precisa ser atualizado manualmente se o GitHub rotacionar certificados. O parâmetro é exigido pela CLI, mas seu valor exato tem efeito reduzido na validação atual.
 
 ## Pré-requisitos
 
