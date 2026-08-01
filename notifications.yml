@@ -4,6 +4,7 @@ name: Notificações do Pipeline
 # Este workflow é acionado automaticamente após a conclusão do pipeline
 # principal (ci-cd-kiro.yml) para enviar notificações sobre o resultado
 # do deploy.
+# Autor.: João Rafael F. Bonilha
 # ---------------------------------------------------------------------------
 
 on:
