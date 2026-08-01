@@ -1,5 +1,5 @@
 name: CI/CD com Kiro + AWS
-
+#
 # ---------------------------------------------------------------------------
 # Visão geral do pipeline:
 # 1) security-scan      -> varredura de segurança (Trivy)
@@ -10,6 +10,7 @@ name: CI/CD com Kiro + AWS
 # 6) rollback           -> se health check falhar, faz rollback
 # 7) kiro-auto-fix      -> se o deploy falhar, Kiro investiga, corrige e abre PR
 # 8) notify             -> notifica time sobre o resultado
+# Autor.: Joao Rafael F. Bonilha
 # ---------------------------------------------------------------------------
 
 on:
