@@ -1,50 +1,155 @@
+  // -------------------------------------------------------------------------
+  // Arquivo para controlar as permissoes e politicas de deploy
+  // Autor.: Joao Rafael F. Bonilha
+  // Versao.: 0.1
+  // -------------------------------------------------------------------------
+
 {
   "Version": "2012-10-17",
   "Statement": [
+
+    // -------------------------------------------------------------------------
+    // CDK: operações no CloudFormation
+    // Escopo restrito às stacks do projeto — sem acesso a stacks de outros times
+    // -------------------------------------------------------------------------
     {
-      "Sid": "CDKDeployPermissions",
+      "Sid": "CDKCloudFormationDeploy",
       "Effect": "Allow",
       "Action": [
         "cloudformation:CreateStack",
         "cloudformation:UpdateStack",
+        "cloudformation:DeleteStack",
         "cloudformation:DescribeStacks",
         "cloudformation:DescribeStackEvents",
         "cloudformation:DescribeStackResources",
+        "cloudformation:DescribeStackResource",
         "cloudformation:GetTemplate",
-        "cloudformation:DeleteStack"
+        "cloudformation:GetTemplateSummary",
+        "cloudformation:ValidateTemplate",
+        // Necessário para CDK Diff e CDK Deploy --rollback
+        "cloudformation:DetectStackDrift",
+        "cloudformation:DescribeStackDriftDetectionStatus"
       ],
-      "Resource": "arn:aws:cloudformation:us-east-1:123456789012:stack/SEU-PROJETO-*/*"
+      "Resource": [
+        "arn:aws:cloudformation:us-east-1:123456789012:stack/meu-projeto-*/*",
+        // Stack de bootstrap do CDK (necessária para cdk deploy funcionar)
+        "arn:aws:cloudformation:us-east-1:123456789012:stack/CDKToolkit/*"
+      ],
+      "Condition": {
+        // Garante que o deploy só roda na região esperada
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
     },
+
+    // -------------------------------------------------------------------------
+    // CDK: bucket de assets (artefatos de build enviados antes do deploy)
+    // Restrito ao bucket de bootstrap específico desta conta/região
+    // -------------------------------------------------------------------------
     {
-      "Sid": "CDKAssetsBucket",
+      "Sid": "CDKAssetsBucketReadWrite",
       "Effect": "Allow",
       "Action": [
         "s3:GetObject",
         "s3:PutObject",
-        "s3:ListBucket"
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
       ],
-      "Resource": [
-        "arn:aws:s3:::cdk-hnb659fds-assets-123456789012-us-east-1",
-        "arn:aws:s3:::cdk-hnb659fds-assets-123456789012-us-east-1/*"
-      ]
+      "Resource": "arn:aws:s3:::cdk-hnb659fds-assets-123456789012-us-east-1/*",
+      "Condition": {
+        // Bloqueia upload sem criptografia em trânsito
+        "Bool": {
+          "aws:SecureTransport": "true"
+        }
+      }
     },
     {
-      "Sid": "AssumeCDKExecutionRole",
+      "Sid": "CDKAssetsBucketList",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": "arn:aws:s3:::cdk-hnb659fds-assets-123456789012-us-east-1",
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "true"
+        }
+      }
+    },
+
+    // -------------------------------------------------------------------------
+    // CDK: assume as roles de execução do bootstrap
+    // O CDK usa roles separadas para deploy, lookup e image publishing
+    // -------------------------------------------------------------------------
+    {
+      "Sid": "CDKAssumeBootstrapRoles",
       "Effect": "Allow",
       "Action": "sts:AssumeRole",
-      "Resource": "arn:aws:iam::123456789012:role/cdk-hnb659fds-*-role-123456789012-us-east-1"
+      "Resource": [
+        "arn:aws:iam::123456789012:role/cdk-hnb659fds-deploy-role-123456789012-us-east-1",
+        "arn:aws:iam::123456789012:role/cdk-hnb659fds-lookup-role-123456789012-us-east-1",
+        "arn:aws:iam::123456789012:role/cdk-hnb659fds-image-publishing-role-123456789012-us-east-1",
+        "arn:aws:iam::123456789012:role/cdk-hnb659fds-file-publishing-role-123456789012-us-east-1"
+      ]
+      // Sem wildcard (*) na role — lista explícita das 4 roles do bootstrap CDK
     },
+
+    // -------------------------------------------------------------------------
+    // Kiro: leitura de logs do CloudWatch para investigação de falhas
+    // Restrito aos grupos de log do projeto — sem acesso a logs de outros serviços
+    // -------------------------------------------------------------------------
     {
-      "Sid": "KiroLogInvestigation",
+      "Sid": "KiroCloudWatchLogsRead",
       "Effect": "Allow",
       "Action": [
         "logs:GetLogEvents",
         "logs:FilterLogEvents",
         "logs:DescribeLogGroups",
-        "logs:DescribeLogStreams"
+        "logs:DescribeLogStreams",
+        "logs:StartQuery",
+        "logs:GetQueryResults",
+        "logs:StopQuery"
       ],
-      "Resource": "arn:aws:logs:us-east-1:123456789012:log-group:/aws/*:*"
+      "Resource": [
+        // Lambda do projeto
+        "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/meu-projeto-*:*",
+        // API Gateway do projeto (se aplicável)
+        "arn:aws:logs:us-east-1:123456789012:log-group:/aws/apigateway/meu-projeto-*:*",
+        // CDK (logs de deploy)
+        "arn:aws:logs:us-east-1:123456789012:log-group:/aws/codebuild/meu-projeto-*:*"
+      ]
+      // REMOVIDO: "arn:aws:logs:...:log-group:/aws/*:*"
+      // O wildcard /aws/* dava acesso a logs de TODOS os serviços da conta
     },
+
+    // -------------------------------------------------------------------------
+    // Kiro: CloudWatch Metrics — verificação de erros pós-deploy
+    // -------------------------------------------------------------------------
+    {
+      "Sid": "KiroCloudWatchMetricsRead",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:GetMetricStatistics",
+        "cloudwatch:GetMetricData",
+        "cloudwatch:ListMetrics"
+      ],
+      "Resource": "*",
+      // GetMetricStatistics/GetMetricData não suportam restrição de Resource,
+      // mas o Condition abaixo limita à região do projeto
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
+    },
+
+    // -------------------------------------------------------------------------
+    // Kiro: Bedrock — inferência de modelos de IA para análise e auto-fix
+    // Restrito ao modelo específico em uso (evitar uso de modelos não aprovados)
+    // -------------------------------------------------------------------------
     {
       "Sid": "KiroBedrockInference",
       "Effect": "Allow",
@@ -52,7 +157,71 @@
         "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream"
       ],
+      "Resource": [
+        // Anthropic Claude Sonnet (modelo recomendado para o Kiro)
+        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5",
+        // Amazon Nova Pro (alternativa da AWS)
+        "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0"
+      ]
+      // REMOVIDO: "Resource": "*"
+      // O wildcard permitia invocar qualquer modelo Bedrock da conta,
+      // incluindo modelos de custo elevado ou não aprovados pela equipe
+    },
+
+    // -------------------------------------------------------------------------
+    // CloudFormation: leitura de eventos para diagnóstico de falhas pelo Kiro
+    // Permissão adicional sem restrição de stack (necessário para GetTemplateSummary)
+    // -------------------------------------------------------------------------
+    {
+      "Sid": "CloudFormationDescribeAll",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:ListStacks",
+        "cloudformation:ListStackResources"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
+    },
+
+    // -------------------------------------------------------------------------
+    // DENY explícito — bloqueia ações críticas mesmo se outra policy Allow existir
+    // Proteção contra escalonamento de privilégios e alterações destrutivas
+    // -------------------------------------------------------------------------
+    {
+      "Sid": "DenyPrivilegeEscalation",
+      "Effect": "Deny",
+      "Action": [
+        // Impede criação ou modificação de policies IAM
+        "iam:CreatePolicy",
+        "iam:PutRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:UpdateAssumeRolePolicy",
+        // Impede modificação desta própria role (auto-elevação de privilégio)
+        "iam:UpdateRole",
+        "iam:DeleteRole"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyDestructiveActions",
+      "Effect": "Deny",
+      "Action": [
+        // Impede deleção acidental de buckets com dados
+        "s3:DeleteBucket",
+        // Impede desativação de logs de auditoria
+        "cloudtrail:StopLogging",
+        "cloudtrail:DeleteTrail",
+        // Impede deleção de tabelas de banco de dados
+        "dynamodb:DeleteTable",
+        "rds:DeleteDBInstance",
+        "rds:DeleteDBCluster"
+      ],
       "Resource": "*"
     }
+
   ]
 }
